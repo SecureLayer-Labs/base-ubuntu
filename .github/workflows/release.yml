@@ -1,0 +1,106 @@
+name: Build + Publish (GHCR)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+  schedule:
+    # Weekly rebuild (patches/base updates)
+    - cron: "17 2 * * 1"
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  security-events: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: securelayer-labs/base-ubuntu
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu_version: ["22.04", "24.04"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build + Push with attestations
+      # Docker Buildx supports attaching SBOM + provenance to the pushed image. :contentReference[oaicite:1]{index=1}
+      - name: Build & Push (multi-arch) + SBOM/Provenance Attestations
+        id: buildpush
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            UBUNTU_VERSION=${{ matrix.ubuntu_version }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.ubuntu_version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-ubuntu${{ matrix.ubuntu_version }}
+          provenance: true
+          sbom: true
+
+      # Get the immutable digest for signing/scanning
+      - name: Image reference (digest)
+        id: img
+        run: |
+          echo "REF=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.ubuntu_version }}" >> $GITHUB_OUTPUT
+          echo "DIGEST=${{ steps.buildpush.outputs.digest }}" >> $GITHUB_OUTPUT
+          echo "IMMUTABLE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.buildpush.outputs.digest }}" >> $GITHUB_OUTPUT
+
+      # Vulnerability scan (SARIF upload to GitHub Security)
+      - name: Trivy Scan (image)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.img.outputs.IMMUTABLE }}
+          format: sarif
+          output: trivy-${{ matrix.ubuntu_version }}.sarif
+          ignore-unfixed: true
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.ubuntu_version }}.sarif
+
+      # Keyless signing with cosign (OIDC)
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.8.1
+
+      - name: Cosign sign (keyless)
+        run: |
+          cosign sign --yes ${{ steps.img.outputs.IMMUTABLE }}
+
+      # Optional: publish a human-downloadable SBOM file too (in addition to attestations)
+      - name: Generate SBOM (SPDX JSON) with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.img.outputs.IMMUTABLE }}
+          format: spdx-json
+          output-file: sbom-ubuntu${{ matrix.ubuntu_version }}.spdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-ubuntu${{ matrix.ubuntu_version }}
+          path: sbom-ubuntu${{ matrix.ubuntu_version }}.spdx.json
